@@ -1,0 +1,17 @@
+# ssh-egress profile. Copy to ~/.config/ssh-egress/<profile>.conf
+# (or run: ssh-egress -p <profile> init <ssh-host>).
+# One profile = one server = one local SOCKS port.
+
+# Required: hostname, IP, or a Host alias from ~/.ssh/config.
+SSH_HOST=my-vps.example.com
+
+# Optional (otherwise taken from ~/.ssh/config or ssh defaults).
+SSH_USER=ubuntu
+SSH_KEY=$HOME/.ssh/id_ed25519
+SSH_PORT=22
+
+# Local SOCKS5 port. Must be unique per profile.
+SOCKS_PORT=1080
+
+# Seconds without traffic before the tunnel closes by itself.
+IDLE_TIMEOUT=600

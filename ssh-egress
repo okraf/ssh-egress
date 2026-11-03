@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# ssh-egress: run commands through the public IP of a server you own,
+# over an SSH SOCKS5 tunnel (ssh -D). Nothing to install on the server.
+# https://github.com/okraf/ssh-egress (MIT)
+set -euo pipefail
+
+VERSION="1.0.0"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ssh-egress"
+RUN_DIR="$CONF_DIR/run"
+
+usage() {
+  cat <<'EOF'
+ssh-egress: send traffic out through a server's IP, over an SSH SOCKS5 tunnel.
+
+Usage: ssh-egress [-p <profile>] <command> [args]
+
+Commands:
+  init <ssh-host> [port]   create the profile (host can be an ~/.ssh/config alias)
+  up                       open the tunnel
+  down                     close the tunnel
+  status                   show whether the tunnel is open (default command)
+  ip                       compare your direct IP with the tunnel's IP
+  curl <args...>           run curl through the tunnel
+  exec -- <cmd...>         run any command with *_proxy variables set
+  env                      print proxy exports to eval in a shell
+  list                     list profiles and which tunnels are open
+  help | version
+
+Options:
+  -p, --profile <name>     profile to use (default: "default")
+
+Profiles live in ~/.config/ssh-egress/<profile>.conf
+EOF
+}
+
+die() { echo "ssh-egress: $1" >&2; exit "${2:-1}"; }
+
+PROFILE="default"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--profile) [ $# -ge 2 ] || die "missing profile name after $1" 2; PROFILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) echo "ssh-egress $VERSION"; exit 0 ;;
+    *) break ;;
+  esac
+done
+case "$PROFILE" in
+  ''|*[!A-Za-z0-9._-]*) die "invalid profile name: '$PROFILE'" 2 ;;
+esac
+
+# Unix socket paths are limited to ~104 chars (ssh adds a 17-char suffix).
+[ ${#RUN_DIR} -gt 60 ] && RUN_DIR="/tmp/ssh-egress-$(id -u)"
+
+CONF="$CONF_DIR/$PROFILE.conf"
+CTRL="$RUN_DIR/$PROFILE.sock"
+
+conf_value() { (SOCKS_PORT=1080; SSH_HOST="?"; . "$1"; eval "echo \"\${$2}\""); }
+
+next_free_port() {
+  local port=1080 f p
+  for f in "$CONF_DIR"/*.conf; do
+    [ -e "$f" ] || continue
+    p="$(conf_value "$f" SOCKS_PORT)"
+    [ "$p" -ge "$port" ] 2>/dev/null && port=$((p + 1))
+  done
+  echo "$port"
+}
+
+cmd_init() {
+  [ $# -ge 1 ] || die "usage: ssh-egress [-p <profile>] init <ssh-host> [socks-port]" 2
+  [ -e "$CONF" ] && die "profile '$PROFILE' already exists: $CONF"
+  local port="${2:-$(next_free_port)}"
+  mkdir -p "$CONF_DIR"
+  cat > "$CONF" <<EOF
+# ssh-egress profile "$PROFILE". One profile = one server = one local SOCKS port.
+SSH_HOST=$1
+# SSH_USER=ubuntu
+# SSH_KEY=\$HOME/.ssh/id_ed25519
+# SSH_PORT=22
+SOCKS_PORT=$port
+# IDLE_TIMEOUT=600
+EOF
+  echo "created $CONF (SOCKS port $port)"
+  local opt=""; [ "$PROFILE" = "default" ] || opt=" -p $PROFILE"
+  echo "edit it if needed, then: ssh-egress$opt ip"
+}
+
+cmd_list() {
+  echo "Profiles ($CONF_DIR):"
+  local found=0 f name state
+  for f in "$CONF_DIR"/*.conf; do
+    [ -e "$f" ] || continue
+    found=1
+    name="$(basename "$f" .conf)"
+    state="closed"; [ -S "$RUN_DIR/$name.sock" ] && state="OPEN"
+    printf "  %-16s %-32s port %-6s %s\n" "$name" "$(conf_value "$f" SSH_HOST)" "$(conf_value "$f" SOCKS_PORT)" "$state"
+  done
+  [ "$found" = 1 ] || echo "  (none yet: ssh-egress init <ssh-host>)"
+}
+
+load_profile() {
+  [ -f "$CONF" ] || die "no profile '$PROFILE' (create it: ssh-egress -p $PROFILE init <ssh-host>)" 2
+  SSH_HOST="" SSH_USER="" SSH_KEY="" SSH_PORT="" SOCKS_PORT=1080 IDLE_TIMEOUT=600
+  # shellcheck disable=SC1090
+  . "$CONF"
+  [ -n "$SSH_HOST" ] || die "SSH_HOST is empty in $CONF" 2
+  PROXY="socks5h://127.0.0.1:$SOCKS_PORT"
+  mkdir -p -m 0700 "$RUN_DIR"
+  # BatchMode: never fall back to password prompts (one key, one attempt:
+  # friendly with fail2ban). ControlPath: one real TCP connection, reused.
+  SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=30
+       -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new
+       -o ControlPath="$CTRL")
+  [ -n "$SSH_KEY" ] && SSH+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+  [ -n "$SSH_USER" ] && SSH+=(-l "$SSH_USER")
+  [ -n "$SSH_PORT" ] && SSH+=(-p "$SSH_PORT")
+  SSH+=("$SSH_HOST")
+  return 0
+}
+
+is_up() { "${SSH[@]}" -O check >/dev/null 2>&1; }
+
+cmd_up() {
+  if is_up; then echo "already open: $PROXY -> $SSH_HOST"; return 0; fi
+  rm -f "$CTRL"
+  "${SSH[@]}" -o ExitOnForwardFailure=yes -o ControlMaster=yes \
+    -o ControlPersist="$IDLE_TIMEOUT" -fNT -D "127.0.0.1:$SOCKS_PORT" \
+    || die "could not open the tunnel to $SSH_HOST"
+  is_up || die "tunnel to $SSH_HOST did not come up"
+  echo "tunnel open: $PROXY -> $SSH_HOST"
+}
+
+cmd_down() {
+  if is_up; then "${SSH[@]}" -O exit 2>/dev/null || true; echo "tunnel closed"
+  else echo "no open tunnel for profile '$PROFILE'"; fi
+}
+
+cmd_status() {
+  if is_up; then echo "OPEN    $PROXY -> $SSH_HOST"
+  else echo "CLOSED  (profile '$PROFILE' -> $SSH_HOST)"; fi
+}
+
+cmd_ip() {
+  cmd_up >/dev/null
+  local s="127.0.0.1:$SOCKS_PORT"
+  echo "direct            : $(curl -s -m 8 https://api.ipify.org || echo '?')"
+  echo "via tunnel (IPv4) : $(curl -s -m 12 --socks5-hostname "$s" https://api.ipify.org || echo '?')"
+  echo "via tunnel (any)  : $(curl -s -m 12 --socks5-hostname "$s" https://api64.ipify.org || echo '?')"
+}
+
+cmd_curl() { cmd_up >/dev/null; exec curl --socks5-hostname "127.0.0.1:$SOCKS_PORT" "$@"; }
+
+cmd_exec() {
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "usage: ssh-egress exec -- <cmd...>" 2
+  cmd_up >/dev/null
+  ALL_PROXY="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" \
+  all_proxy="$PROXY" http_proxy="$PROXY" https_proxy="$PROXY" \
+  NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1" \
+    exec "$@"
+}
+
+cmd_env() {
+  cmd_up >/dev/null
+  cat <<EOF
+export ALL_PROXY=$PROXY HTTP_PROXY=$PROXY HTTPS_PROXY=$PROXY
+export all_proxy=$PROXY http_proxy=$PROXY https_proxy=$PROXY
+export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1
+# back to direct: unset ALL_PROXY HTTP_PROXY HTTPS_PROXY all_proxy http_proxy https_proxy
+EOF
+}
+
+cmd="${1:-status}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  help) usage ;;
+  version) echo "ssh-egress $VERSION" ;;
+  init) cmd_init "$@" ;;
+  list) cmd_list ;;
+  up|down|status|ip|curl|exec|env) load_profile; "cmd_$cmd" "$@" ;;
+  *) usage >&2; exit 2 ;;
+esac
